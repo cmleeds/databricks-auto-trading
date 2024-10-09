@@ -1,12 +1,12 @@
 # Databricks notebook source
+import alpaca_trade_api as tradeapi
+
+# COMMAND ----------
+
 # get secrets needed for connection with alpaca API
 base_url = dbutils.secrets.get(scope="my-secrets", key="alpaca-api-base-url")
 api_key = dbutils.secrets.get(scope="my-secrets", key="alpaca-api-key")
 secret_key = dbutils.secrets.get(scope="my-secrets", key="alpaca-api-secret-key")
-
-# COMMAND ----------
-
-import alpaca_trade_api as tradeapi
 
 # COMMAND ----------
 
