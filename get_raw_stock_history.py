@@ -1,66 +1,89 @@
 # Databricks notebook source
-# get secrets needed for connection with alpaca API
-base_url = dbutils.secrets.get(scope="my-secrets", key="alpaca-api-base-url")
-api_key = dbutils.secrets.get(scope="my-secrets", key="alpaca-api-key")
-secret_key = dbutils.secrets.get(scope="my-secrets", key="alpaca-api-secret-key")
-
-# COMMAND ----------
-
-import alpaca_trade_api as tradeapi
-api = tradeapi.REST(api_key, secret_key, base_url, api_version='v2')
-
-
-# COMMAND ----------
-
-query = """
-SELECT *
-FROM hive_metastore.bronze.ticker_info
-WHERE price < 5
-"""
-df = spark.sql(query)
-display(df)
-
-# COMMAND ----------
-
-start_year = 2010
-timeframe='1Day'
-symbols = df.select("symbol").collect()
-# Convert the list of symbols to a list of strings
-symbol_list = [row['symbol'] for row in symbols]
+# MAGIC %md
+# MAGIC load needed libraries and authenticate with the alpaca API and import needed libraries
 
 # COMMAND ----------
 
 from tqdm import tqdm
 import time
-bar_data = []
+from tqdm import tqdm
+import pandas as pd
+from datetime import datetime
+import alpaca_trade_api as tradeapi
+from datetime import datetime, timedelta
 
-# Loop through each year
-api_call_count = 0
-for year in range(start_year, start_year + 1):
-    start_date = f"{year}-01-01T00:00:00Z"
 
-    for symbol in tqdm(symbol_list, desc=f"Fetching daily stock prices"):
-        bars = api.get_bars(symbol, timeframe, start=start_date, limit=10000)
-        for bar in bars:
-            bar_data.append({
-                'symbol': symbol,
-                'time': bar.t,
-                'open': bar.o,
-                'high': bar.h,
-                'low': bar.l,
-                'close': bar.c,
-                'volume': bar.v
-            })
-            
-        api_call_count += 1
-        if api_call_count % 200 == 0:
-            time.sleep(60)
+from pyspark.sql.functions import col, max
+from pyspark.sql.utils import AnalysisException
+from pyspark.sql.types import StructType, StructField, StringType, DateType, DoubleType, IntegerType, LongType
+
+
+# get secrets needed for connection with alpaca API
+base_url = dbutils.secrets.get(scope="my-secrets", key="alpaca-api-base-url")
+api_key = dbutils.secrets.get(scope="my-secrets", key="alpaca-api-key")
+secret_key = dbutils.secrets.get(scope="my-secrets", key="alpaca-api-secret-key")
+api = tradeapi.REST(api_key, secret_key, base_url, api_version='v2')
+
+# this is the default start time if we have no prior stored stock date
+default_start_date = "2010-01-01"
 
 # COMMAND ----------
 
-from pyspark.sql.types import StructType, StructField, StringType, DateType, DoubleType, IntegerType, LongType
-import pandas as pd
-from datetime import datetime
+# MAGIC %md
+# MAGIC - The `most_recent_date` variable should be passed from the update_stock_history notebook.
+
+# COMMAND ----------
+
+try:
+    # Load the table into a DataFrame
+    df = spark.table("hive_metastore.bronze.stock_history")
+
+    # Retrieve the most recent date value
+    most_recent_date = df.select(max(col("time"))).collect()[0][0]
+    # Add exactly one day to the most recent date
+    most_recent_date += timedelta(days=1)
+    most_recent_date_str = most_recent_date.strftime('%Y-%m-%d')
+    most_recent_date_str
+except AnalysisException:
+    # If the table does not exist, return an empty datetime value
+    most_recent_date_str = default_start_date
+
+most_recent_date_str
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC The following query will help us identify which ticker symbols to collect data for, we are currently commenting this out since we'll need to add nuances in the workflow. 
+
+# COMMAND ----------
+
+symbols = df.select(col("symbol")).distinct().collect()
+symbol_list = [row['symbol'] for row in symbols]
+
+# COMMAND ----------
+
+timeframe = '1Day'
+bar_data = []
+start_date = f"{most_recent_date_str}T00:00:00Z"
+
+# loop through each ticker symbol and retreive stock market data for all days from last time run
+for symbol in tqdm(symbol_list, desc=f"Fetching daily stock prices"):
+    bars = api.get_bars(symbol, timeframe, start=start_date, limit=10000)
+    for bar in bars:
+        bar_data.append({
+            'symbol': symbol,
+            'time': bar.t,
+            'open': bar.o,
+            'high': bar.h,
+            'low': bar.l,
+            'close': bar.c,
+            'volume': bar.v
+        })
+        
+    # alpaca API call limit is 200 per minute, so lets slow down to 120 per minute
+    time.sleep(0.5)
+
+# COMMAND ----------
 
 # Convert pandas.Timestamp to datetime.date
 for record in bar_data:
@@ -94,4 +117,7 @@ bar_df.count()
 
 # COMMAND ----------
 
-bar_df.write.format("delta").option("mergeSchema", "true").mode("overwrite").saveAsTable("hive_metastore.bronze.stock_history")
+if most_recent_date_str != default_start_date:
+    bar_df.write.format("delta").option("mergeSchema", "true").mode("append").saveAsTable("hive_metastore.bronze.stock_history")
+else:
+    bar_df.write.format("delta").option("mergeSchema", "true").mode("overwrite").saveAsTable("hive_metastore.bronze.stock_history")
